@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-TERMINAL = {"completed", "failed", "cancelled", "continued"}
+TERMINAL = {"completed", "failed", "cancelled", "continued", "parked"}
 
 
 class Client:
@@ -26,7 +26,12 @@ class Client:
         return r.json()
 
     def start(
-        self, workflow: str, input: Any = None, *, version: int = 1, request_id: str | None = None
+        self,
+        workflow: str,
+        input: Any = None,
+        *,
+        version: int | None = None,
+        request_id: str | None = None,
     ) -> str:
         body = {"workflow": workflow, "version": version, "input": input, "request_id": request_id}
         return self._ok(self._http.post("/v1/runs", json=body))["run_id"]

@@ -79,3 +79,30 @@ def long_step(sctx: StepContext, seconds: float) -> dict:
 @workflow
 async def long_running(ctx, inp):
     return await ctx.step(long_step, inp["seconds"])
+
+
+@workflow
+async def poison(ctx, inp):
+    import asyncio
+
+    await asyncio.sleep(0)  # a bug: awaits something that is not a ctx call
+
+
+@workflow
+async def looper(ctx, inp):
+    total = inp["total"]
+    for _ in range(inp["per_round"]):
+        total += int((await ctx.random()) >= 0)
+    if inp["round"] + 1 < inp["rounds"]:
+        return await ctx.continue_as_new({**inp, "total": total, "round": inp["round"] + 1})
+    return total
+
+
+@step
+def big(sctx, kb: int) -> str:
+    return "x" * (kb * 1024)
+
+
+@workflow
+async def big_result(ctx, inp):
+    return len(await ctx.step(big, inp["kb"]))

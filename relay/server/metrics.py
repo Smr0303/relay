@@ -31,3 +31,6 @@ OLDEST_READY = Gauge("relay_oldest_ready_task_seconds", "Age of the oldest ready
 TIMERS_PENDING = Gauge("relay_timers_pending", "Timers waiting to fire")
 TIMERS_OVERDUE = Gauge("relay_timers_overdue_seconds", "How overdue the oldest pending timer is")
 LEASED = Gauge("relay_tasks_leased", "Tasks currently leased by workers", ["kind"])
+JOURNAL_WARNINGS = Counter(
+    "relay_journal_warnings_total", "Runs whose journal crossed 10k events (use continue_as_new)"
+)

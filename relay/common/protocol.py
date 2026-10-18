@@ -24,6 +24,9 @@ class EventType(StrEnum):
     VALUE_RECORDED = "ValueRecorded"
     RUN_COMPLETED = "RunCompleted"
     RUN_FAILED = "RunFailed"
+    MARKER_RECORDED = "MarkerRecorded"
+    CANCEL_REQUESTED = "CancelRequested"
+    RUN_CONTINUED = "RunContinued"
 
 
 class Event(BaseModel):
@@ -80,6 +83,21 @@ class RecordValue(BaseModel):
     value: Any
 
 
+class RecordMarker(BaseModel):
+    """ctx.patched(): marks that this run took the new code path at this point."""
+
+    kind: Literal["record_marker"] = "record_marker"
+    call_seq: int
+    patch_id: str
+
+
+class ContinueAsNew(BaseModel):
+    """Close this run and start a fresh one with `input` (keeps journals short)."""
+
+    kind: Literal["continue_as_new"] = "continue_as_new"
+    input: Any
+
+
 class CompleteRun(BaseModel):
     kind: Literal["complete_run"] = "complete_run"
     result: Any
@@ -91,7 +109,14 @@ class FailRun(BaseModel):
 
 
 Command = Annotated[
-    ScheduleStep | CreateTimer | CancelTimer | RecordValue | CompleteRun | FailRun,
+    ScheduleStep
+    | CreateTimer
+    | CancelTimer
+    | RecordValue
+    | RecordMarker
+    | ContinueAsNew
+    | CompleteRun
+    | FailRun,
     Field(discriminator="kind"),
 ]
 
@@ -110,6 +135,10 @@ def events_for(cmd: Command) -> list[tuple[EventType, int | None, dict[str, Any]
         case RecordValue():
             payload = {"kind": cmd.value_kind, "value": cmd.value}
             return [(EventType.VALUE_RECORDED, cmd.call_seq, payload)]
+        case RecordMarker():
+            return [(EventType.MARKER_RECORDED, cmd.call_seq, {"patch_id": cmd.patch_id})]
+        case ContinueAsNew():
+            return [(EventType.RUN_CONTINUED, None, {"input": cmd.input})]
         case CompleteRun():
             return [(EventType.RUN_COMPLETED, None, {"result": cmd.result})]
         case FailRun():
@@ -131,7 +160,7 @@ def ensure_json(value: Any, what: str) -> Any:
 
 class StartRun(BaseModel):
     workflow: str
-    version: int = 1
+    version: int | None = None  # None = the newest version a live worker serves
     input: Any = None
     request_id: str | None = None
 

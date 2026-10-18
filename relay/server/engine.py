@@ -24,6 +24,7 @@ from relay.common.protocol import (
     AckStep,
     CancelTimer,
     CompleteRun,
+    ContinueAsNew,
     CreateTimer,
     Event,
     EventType,
@@ -36,9 +37,13 @@ from relay.common.protocol import (
     events_for,
 )
 from relay.server import metrics
+from relay.server.blobs import BlobStore, blob_store_from_env
 
 SHARDS = 16
-SCHEMA_VERSION = 1  # bump when schema.sql changes
+SCHEMA_VERSION = 2  # bump when schema.sql changes
+JOURNAL_WARN = 10_000
+JOURNAL_LIMIT = int(os.environ.get("RELAY_JOURNAL_LIMIT", 50_000))
+ADVANCE_BACKOFF_S = float(os.environ.get("RELAY_ADVANCE_BACKOFF_S", 1.0))
 TERMINAL = ("completed", "failed", "cancelled", "continued")
 ADVANCE_MAX_ATTEMPTS = 5
 ADVANCE_TIMEOUT_S = float(os.environ.get("RELAY_ADVANCE_TIMEOUT_S", 30))
@@ -165,9 +170,16 @@ def _uuid(value: str) -> uuid.UUID:
 
 
 class Engine:
-    def __init__(self, pool: asyncpg.Pool, on_tasks: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        on_tasks: Callable[[], None] | None = None,
+        blobs: BlobStore | None = None,
+    ) -> None:
         self.pool = pool
         self.on_tasks = on_tasks or (lambda: None)
+        self.blobs = blobs or blob_store_from_env()
+        self._seen: dict[str, float] = {}  # queue -> last time we recorded a worker serving it
 
     @contextlib.asynccontextmanager
     async def _tx(self):
@@ -192,7 +204,6 @@ class Engine:
     # client side
 
     async def start_run(self, req: StartRun) -> tuple[str, bool]:
-        run_id = uuid.uuid4()
         async with self._tx() as conn:
             if req.request_id is not None:
                 existing = await conn.fetchval(
@@ -200,28 +211,87 @@ class Engine:
                 )
                 if existing:
                     return str(existing), False
-            run = await conn.fetchrow(
-                "INSERT INTO runs (run_id, workflow, version, status, input, request_id, shard, "
-                "next_seq) VALUES ($1,$2,$3,'running',$4,$5,$6,2) "
-                "ON CONFLICT (request_id) DO NOTHING "
-                "RETURNING run_id, workflow, version, shard",
-                run_id,
-                req.workflow,
-                req.version,
-                req.input,
-                req.request_id,
-                run_id.int % SHARDS,
-            )
-            if run is None:  # lost a race on the same request_id
+            version = req.version or await self._live_version(conn, req.workflow)
+            run_id = await self._create_run(conn, req.workflow, version, req.input, req.request_id)
+            if run_id is None:  # lost a race on the same request_id
                 existing = await conn.fetchval(
                     "SELECT run_id FROM runs WHERE request_id=$1", req.request_id
                 )
                 return str(existing), False
-            await _append(conn, run_id, 1, [(EventType.RUN_STARTED, None, {"input": req.input})])
+        return str(run_id), True
+
+    async def _live_version(self, conn, workflow: str) -> int:
+        """The newest version a worker served in the last 5 minutes (new runs start there;
+        old runs stay pinned to the version they started on)."""
+        v = await conn.fetchval(
+            "SELECT max(version) FROM workflow_versions "
+            "WHERE workflow=$1 AND seen_at > now() - interval '5 minutes'",
+            workflow,
+        )
+        return v or 1
+
+    async def _create_run(
+        self, conn, workflow, version, input, request_id=None, continued_from=None
+    ):
+        run_id = uuid.uuid4()
+        run = await conn.fetchrow(
+            "INSERT INTO runs (run_id, workflow, version, status, input, request_id, shard, "
+            "next_seq) VALUES ($1,$2,$3,'running',$4,$5,$6,2) "
+            "ON CONFLICT (request_id) DO NOTHING "
+            "RETURNING run_id, workflow, version, shard",
+            run_id,
+            workflow,
+            version,
+            input,
+            request_id,
+            run_id.int % SHARDS,
+        )
+        if run is None:
+            return None
+        payload = {"input": input}
+        if continued_from is not None:
+            payload["continued_from"] = str(continued_from)
+        await _append(conn, run_id, 1, [(EventType.RUN_STARTED, None, payload)])
+        await _enqueue_advance(conn, run)
+        self._wake()
+        metrics.RUNS_STARTED.inc()
+        return run_id
+
+    async def cancel(self, run_id: str) -> None:
+        """Record the request; the workflow sees Cancelled at its next ctx call and may run
+        compensation steps before it ends."""
+        rid = _uuid(run_id)
+        async with self._tx() as conn:
+            run = await _lock_run(conn, rid)
+            if run is None:
+                raise NotFound(run_id)
+            if run["status"] in TERMINAL:
+                raise Conflict(f"run is {run['status']}")
+            seq = await _append(
+                conn, rid, run["next_seq"], [(EventType.CANCEL_REQUESTED, None, {})]
+            )
+            await conn.execute(
+                "UPDATE runs SET next_seq=$2, updated_at=now() WHERE run_id=$1", rid, seq
+            )
+            if run["status"] != "parked":
+                await _enqueue_advance(conn, run)
+                self._wake()
+
+    async def resume(self, run_id: str) -> None:
+        """Un-park a run (after deploying fixed code): replay it again from its journal."""
+        rid = _uuid(run_id)
+        async with self._tx() as conn:
+            run = await _lock_run(conn, rid)
+            if run is None:
+                raise NotFound(run_id)
+            if run["status"] != "parked":
+                raise Conflict(f"run is {run['status']}, not parked")
+            await conn.execute(
+                "UPDATE runs SET status='running', error=NULL, updated_at=now() WHERE run_id=$1",
+                rid,
+            )
             await _enqueue_advance(conn, run)
             self._wake()
-        metrics.RUNS_STARTED.inc()
-        return str(run_id), True
 
     async def get_run(self, run_id: str) -> dict | None:
         row = await self.pool.fetchrow(
@@ -272,6 +342,7 @@ class Engine:
 
     async def claim(self, poll: Poll) -> list[Task]:
         queues = [f"{name}:{version}" for name, version in poll.handles]
+        await self._record_handles(poll.handles)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -305,12 +376,15 @@ class Engine:
                     "WHERE run_id = ANY($1::uuid[]) ORDER BY run_id, seq",
                     advance_runs,
                 ):
+                    payload = e["payload"]
+                    if "result_ref" in payload:  # large step result kept out of Postgres
+                        payload = {**payload, "result": self.blobs.get(payload["result_ref"])}
                     journals[e["run_id"]].append(
                         Event(
                             seq=e["seq"],
                             type=e["type"],
                             call_seq=e["call_seq"],
-                            payload=e["payload"],
+                            payload=payload,
                         )
                     )
         tasks = []
@@ -334,6 +408,21 @@ class Engine:
                 )
             )
         return tasks
+
+    async def _record_handles(self, handles) -> None:
+        import time
+
+        now = time.monotonic()
+        due = [(n, v) for n, v in handles if now - self._seen.get(f"{n}:{v}", -1e9) > 10]
+        if not due:
+            return
+        for n, v in due:
+            self._seen[f"{n}:{v}"] = now
+        await self.pool.executemany(
+            "INSERT INTO workflow_versions (workflow, version, seen_at) VALUES ($1,$2,now()) "
+            "ON CONFLICT (workflow, version) DO UPDATE SET seen_at = now()",
+            due,
+        )
 
     async def _locked_task(self, conn, task_id: str, token: str, kind: str):
         """Lock run then task, and check the caller still holds the lease (fencing)."""
@@ -399,6 +488,28 @@ class Engine:
                 case FailRun():
                     status = "cancelled" if cmd.error.get("type") == "Cancelled" else "failed"
                     close = (status, None, cmd.error)
+                case ContinueAsNew():
+                    new_id = await self._create_run(
+                        conn, run["workflow"], run["version"], cmd.input, continued_from=rid
+                    )
+                    close = ("continued", {"continued_as": str(new_id)}, None)
+        length = run["next_seq"] - 1 + len(rows)
+        if length > JOURNAL_LIMIT:
+            # A run that loops without continue_as_new would replay ever slower; stop it.
+            await _close_run(
+                conn,
+                rid,
+                "failed",
+                None,
+                {
+                    "type": "JournalLimit",
+                    "message": f"journal would reach {length} events (limit {JOURNAL_LIMIT}); "
+                    "use ctx.continue_as_new in long loops",
+                },
+            )
+            return None
+        if run["next_seq"] - 1 < JOURNAL_WARN <= length:
+            metrics.JOURNAL_WARNINGS.inc()
         seq = await _append(conn, rid, run["next_seq"], rows)
         status = "running" if steps else "suspended"
         await conn.execute(
@@ -456,7 +567,8 @@ class Engine:
         if task["attempt"] >= ADVANCE_MAX_ATTEMPTS:
             await _park(conn, run["run_id"], error)
             return
-        await self._requeue_advance(conn, task, delay_s=2.0 ** task["attempt"])
+        delay = ADVANCE_BACKOFF_S * 2.0 ** (task["attempt"] - 1)
+        await self._requeue_advance(conn, task, delay_s=delay)
 
     async def _release_advance(self, conn, task) -> None:
         pending = await conn.fetchval(
@@ -498,7 +610,13 @@ class Engine:
                 await conn.execute("DELETE FROM tasks WHERE task_id=$1", task["task_id"])
                 return  # e.g. cancelled while this step ran: the result is discarded
             if ack.error is None:
-                rows = [(EventType.STEP_COMPLETED, cs, {"result": ack.result, "attempt": attempt})]
+                payload = {"result": ack.result, "attempt": attempt}
+                raw = json.dumps(ack.result).encode()
+                if len(raw) > self.blobs.max_inline:  # keep the journal row small
+                    ref = f"{rid}/{cs}"
+                    self.blobs.put(ref, ack.result)
+                    payload = {"result_ref": ref, "bytes": len(raw), "attempt": attempt}
+                rows = [(EventType.STEP_COMPLETED, cs, payload)]
                 await self._finish_step(conn, run, task, rows)
                 metrics.STEPS_COMPLETED.inc()
                 return

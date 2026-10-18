@@ -84,3 +84,11 @@ CREATE TABLE IF NOT EXISTS signals (
   received_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS signals_run ON signals (run_id);
+
+-- Which workflow versions live workers serve; a start without a version uses the newest.
+CREATE TABLE IF NOT EXISTS workflow_versions (
+  workflow text NOT NULL,
+  version  int  NOT NULL,
+  seen_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workflow, version)
+);

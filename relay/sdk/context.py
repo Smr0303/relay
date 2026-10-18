@@ -36,7 +36,17 @@ class ValueOp:
     kind: str  # "now" | "uuid" | "random"
 
 
-Op = StepOp | SleepOp | WaitSignalOp | ValueOp
+@dataclass(frozen=True)
+class PatchOp:
+    patch_id: str
+
+
+@dataclass(frozen=True)
+class ContinueAsNewOp:
+    input: Any
+
+
+Op = StepOp | SleepOp | WaitSignalOp | ValueOp | PatchOp | ContinueAsNewOp
 
 
 class _Call:
@@ -73,6 +83,21 @@ class WorkflowContext:
     def wait_signal(self, name: str, timeout: float | timedelta | None = None) -> _Call:
         """Returns the signal's data, or None if the timeout fired first."""
         return _Call(WaitSignalOp(name, None if timeout is None else _seconds(timeout)))
+
+    def patched(self, patch_id: str) -> _Call:
+        """True for runs that reach this point on the new code; False for runs whose journal
+        already went past it on the old code. Wrap a change to code that live runs execute:
+
+            if await ctx.patched("add-fraud-check"):
+                await ctx.step(fraud_check, order_id)
+        """
+        return _Call(PatchOp(patch_id))
+
+    def continue_as_new(self, input: Any) -> _Call:
+        """End this run and start a fresh one of the same workflow with `input`.
+        Use as `return await ctx.continue_as_new(state)` in long loops."""
+        ensure_json(input, "continue_as_new input")
+        return _Call(ContinueAsNewOp(input))
 
     def now(self) -> _Call:
         return _Call(ValueOp("now"))

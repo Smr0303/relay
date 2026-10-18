@@ -21,6 +21,7 @@ from typing import Any
 from relay.common.protocol import (
     CancelTimer,
     CompleteRun,
+    ContinueAsNew,
     CreateTimer,
     Event,
     EventType,
@@ -33,7 +34,7 @@ from relay.sdk.replay import Decision, error_dict, replay
 from relay.sdk.workflow import Registry
 from relay.sdk.workflow import registry as default_registry
 
-TERMINAL = {"completed", "failed"}
+TERMINAL = {"completed", "failed", "cancelled", "continued"}
 _EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -130,6 +131,10 @@ class LocalEngine:
         self._append(run_id, EventType.SIGNAL_RECEIVED, None, payload)
         self._tick()
 
+    def cancel(self, run_id: str) -> None:
+        self._append(run_id, EventType.CANCEL_REQUESTED, None, {})
+        self._tick()
+
     def journal(self, run_id: str) -> list[Event]:
         return self.store.journals[run_id]
 
@@ -198,7 +203,11 @@ class LocalEngine:
                 case CompleteRun():
                     rec.status, rec.result = "completed", cmd.result
                 case FailRun():
-                    rec.status, rec.error = "failed", cmd.error
+                    cancelled = cmd.error.get("type") == "Cancelled"
+                    rec.status, rec.error = ("cancelled" if cancelled else "failed"), cmd.error
+                case ContinueAsNew():
+                    new_id = self.start(rec.workflow, cmd.input)
+                    rec.status, rec.result = "continued", {"continued_as": new_id}
         if rec.status not in TERMINAL:
             rec.status = "running"
         self._tick()

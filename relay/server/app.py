@@ -65,7 +65,7 @@ class Notifier:
             try:
                 conn = await asyncpg.connect(self._dsn)
                 lost = asyncio.Event()
-                conn.add_termination_listener(lambda _c: lost.set())
+                conn.add_termination_listener(lambda _c, ev=lost: ev.set())
                 await conn.add_listener("relay_tasks", self._on_notify)
                 self.wake()
                 await lost.wait()
@@ -188,6 +188,26 @@ def create_app(
     async def signal(run_id: str, body: SignalIn):
         try:
             await eng().signal(run_id, body.name, body.data)
+        except NotFound:
+            raise HTTPException(404, "no such run") from None
+        except Conflict as err:
+            raise HTTPException(409, str(err)) from None
+        return {"ok": True}
+
+    @app.post("/v1/runs/{run_id}/cancel")
+    async def cancel(run_id: str):
+        try:
+            await eng().cancel(run_id)
+        except NotFound:
+            raise HTTPException(404, "no such run") from None
+        except Conflict as err:
+            raise HTTPException(409, str(err)) from None
+        return {"ok": True}
+
+    @app.post("/v1/runs/{run_id}/resume")
+    async def resume(run_id: str):
+        try:
+            await eng().resume(run_id)
         except NotFound:
             raise HTTPException(404, "no such run") from None
         except Conflict as err:
