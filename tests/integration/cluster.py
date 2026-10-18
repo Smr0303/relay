@@ -68,6 +68,7 @@ class Cluster:
             **(env_extra or {}),
         }
         self.server_urls: list[str] = []
+        self.servers: dict[int, subprocess.Popen] = {}
         self.effects_url = ""
 
     def _spawn(self, args: list[str], log_name: str) -> subprocess.Popen:
@@ -76,15 +77,23 @@ class Cluster:
             [sys.executable, *args], env=self.env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT
         )
 
-    def start_server(self) -> str:
-        port = free_port()
-        self.procs.append(
-            self._spawn(["-m", "relay.server", "--port", str(port)], f"server-{port}.log")
-        )
+    def start_server(self, port: int | None = None) -> str:
+        port = port or free_port()
+        proc = self._spawn(["-m", "relay.server", "--port", str(port)], f"server-{port}.log")
+        self.procs.append(proc)
+        self.servers[port] = proc
         url = f"http://127.0.0.1:{port}"
         wait_http(url + "/healthz")
-        self.server_urls.append(url)
+        if url not in self.server_urls:
+            self.server_urls.append(url)
         return url
+
+    def kill_server(self, url: str) -> int:
+        port = int(url.rsplit(":", 1)[1])
+        proc = self.servers.pop(port)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+        return port
 
     def start_effects(self) -> str:
         port = free_port()
@@ -99,24 +108,14 @@ class Cluster:
         return self.effects_url
 
     def start_worker(
-        self, app: str = "examples.order", server: str | None = None, slots: int = 50
+        self, app: str | list[str] = "examples.order", server: str | None = None, slots: int = 50
     ) -> subprocess.Popen:
         server = server or self.server_urls[len(self.workers) % len(self.server_urls)]
-        p = self._spawn(
-            [
-                "-m",
-                "relay.sdk.worker",
-                "--app",
-                app,
-                "--server",
-                server,
-                "--slots",
-                str(slots),
-                "--pollers",
-                "2",
-            ],
-            f"worker-{len(self.workers)}.log",
-        )
+        apps = [app] if isinstance(app, str) else app
+        app_args = [a for name in apps for a in ("--app", name)]
+        args = ["-m", "relay.sdk.worker", *app_args, "--server", server]
+        args += ["--slots", str(slots), "--pollers", "2"]
+        p = self._spawn(args, f"worker-{len(self.workers)}.log")
         self.workers.append(p)
         return p
 

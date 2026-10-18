@@ -42,15 +42,12 @@ class Notifier:
         self._event = asyncio.Event()
         self._dirty = asyncio.Event()
         self._id = uuid.uuid4().hex
-        self._listen: asyncpg.Connection | None = None
-        self._pub: asyncpg.Connection | None = None
-        self._task: asyncio.Task | None = None
+        self._dsn = ""
+        self._tasks: list[asyncio.Task] = []
 
     async def start(self, dsn: str) -> None:
-        self._listen = await asyncpg.connect(dsn)
-        self._pub = await asyncpg.connect(dsn)
-        await self._listen.add_listener("relay_tasks", self._on_notify)
-        self._task = asyncio.create_task(self._publisher())
+        self._dsn = dsn
+        self._tasks = [asyncio.create_task(self._listen()), asyncio.create_task(self._publisher())]
 
     def _on_notify(self, _conn, _pid, _channel, payload) -> None:
         if payload != self._id:  # our own NOTIFY: local polls were already woken
@@ -60,16 +57,43 @@ class Notifier:
         self.wake()
         self._dirty.set()
 
+    async def _listen(self) -> None:
+        """Keep a LISTEN connection up. If Postgres drops it, reconnect and wake everyone,
+        since notifications sent meanwhile are gone (polls also re-check every second)."""
+        while True:
+            conn = None
+            try:
+                conn = await asyncpg.connect(self._dsn)
+                lost = asyncio.Event()
+                conn.add_termination_listener(lambda _c: lost.set())
+                await conn.add_listener("relay_tasks", self._on_notify)
+                self.wake()
+                await lost.wait()
+                log.warning("LISTEN connection lost; reconnecting")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("LISTEN connection failed")
+            finally:
+                if conn is not None and not conn.is_closed():
+                    conn.terminate()
+            await asyncio.sleep(0.5)
+
     async def _publisher(self) -> None:
+        conn = None
         while True:
             await self._dirty.wait()
             self._dirty.clear()
             try:
-                await self._pub.execute("SELECT pg_notify('relay_tasks', $1)", self._id)
+                if conn is None or conn.is_closed():
+                    conn = await asyncpg.connect(self._dsn)
+                await conn.execute("SELECT pg_notify('relay_tasks', $1)", self._id)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("NOTIFY failed")
+                log.exception("NOTIFY failed; reconnecting")
+                conn = None
+                self._dirty.set()
                 await asyncio.sleep(0.5)
 
     def wake(self) -> None:
@@ -80,11 +104,9 @@ class Notifier:
         return self._event
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-        for conn in (self._listen, self._pub):
-            if conn is not None:
-                await conn.close()
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
 
 async def _loop(name: str, interval_s: float, fn) -> None:

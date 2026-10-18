@@ -36,3 +36,5 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["chaos: slow kill-everything test (make chaos)"]
+addopts = "-m 'not chaos' --timeout 300"

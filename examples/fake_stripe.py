@@ -77,6 +77,9 @@ class HttpEffects:
         obj = self._post("refund", idempotency_key, {"charge_id": charge_id})
         return {"refund_id": obj["id"], "charge_id": charge_id}
 
+    def bill_llm(self, purpose: str, idempotency_key: str) -> dict:
+        return self._post("llm", idempotency_key, {"purpose": purpose})
+
     def send(self, to: str, template: str, idempotency_key: str) -> dict:
         obj = self._post("email", idempotency_key, {"to": to, "template": template})
         return {"message_id": obj["id"], "to": to, "template": template}
