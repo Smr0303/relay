@@ -73,7 +73,10 @@ Every run completed, every journal was gapless, and every order was charged exac
  TELEMETRY: Prometheus /metrics + 4 alerts · Grafana dashboard · OTel trace per run (Jaeger)
 ```
 
-[docs/DESIGN.md](docs/DESIGN.md) covers the details: the ack transaction, lease fencing, cancellation semantics, patch gates, wake-ups and shards. It also describes the bugs the tests caught on the way.
+**Docs**
+- [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) is the design before the code: the problem, requirements, back-of-the-envelope sizing, HLD and flows, and an order traced through the database row by row.
+- [docs/DESIGN.md](docs/DESIGN.md) is the design as built: the ack transaction, lease fencing, cancellation, patch gates, wake-ups, shards, and the bugs the tests caught on the way.
+- [bench/results.md](bench/results.md) has every measurement.
 
 ## Estimates vs. measurements
 

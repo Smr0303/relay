@@ -1,12 +1,13 @@
-"""An LLM content pipeline rebuilt on Relay.
+"""An LLM content pipeline (generate a note, judge it, build quiz + flashcards) on Relay.
 
-Before (Celery): status column "generating" -> LLM body -> "generated" -> COMMIT, then
-`.delay()` the cabinet task. A hung call stranded notes in "generating"; a crash between the
-commit and the enqueue lost stage 2; retries were hand-written per task.
+The usual way to build this, on a task queue: set status="generating", call the LLM, set
+status="generated", COMMIT, then enqueue the next stage as a separate call. Three classic
+failures follow: a hung LLM call strands the row in "generating"; a crash between the commit
+and the enqueue silently loses the next stage; and retry/backoff is hand-written per task.
 
-Here it is one function. A hung LLM call just loses its lease and the step retries; the
-cabinet stage cannot be lost because "body done" and "run the judge" are one transaction;
-the retry policy is declared once.
+Here it is one function. A hung LLM call just loses its lease and the step retries; the next
+stage cannot be lost because "body done" and "run the judge" are one transaction; the retry
+policy is declared once.
 """
 
 from examples.fake_llm import LLM
