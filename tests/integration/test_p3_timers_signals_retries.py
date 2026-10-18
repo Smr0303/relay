@@ -20,14 +20,16 @@ def _at(e) -> float:
 
 
 def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
-    """1,000 orders; "shipped" lands right around the 3-"day" timeout (1 day = 1 s here).
+    """1,000 orders; "shipped" lands right around the 3-"day" timeout (1 day = 2 s here).
     Every order must end exactly one way, with effects to match."""
+    cluster.env["ORDER_DAY_SECONDS"] = "2"  # timeout 6 s: room to aim signals on slow CI
     s1, s2 = cluster.start_server(), cluster.start_server()
     cluster.start_effects()
     for _ in range(4):
         cluster.start_worker("examples.order", slots=200)
     c = Client(s1)
     n = 1000
+    timeout_s = 6.0
     with cf.ThreadPoolExecutor(32) as pool:
         starts = list(
             pool.map(
@@ -39,26 +41,42 @@ def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
             )
         )
 
-    def ship(item):
+    def armed_at(item):
+        """When this run's wait (and its timeout) started, or None if it already closed."""
         i, (run_id, _) = item
-        rnd = random.Random(i)
         cl = Client([s1, s2][i % 2])
-        # waiting on "shipped" now (or already timed out and refunded: nothing to send)
         if (
             cl.wait(run_id, timeout=60, statuses={"suspended", "completed"})["status"]
             != "suspended"
         ):
-            return
-        armed = next(_at(e) for e in cl.events(run_id) if e["type"] == "TimerCreated")
-        time.sleep(max(0.0, armed + 3.0 + rnd.uniform(-0.25, 0.25) - time.time()))
+            return None
+        return next(_at(e) for e in cl.events(run_id) if e["type"] == "TimerCreated")
+
+    with cf.ThreadPoolExecutor(64) as pool:
+        armed = list(pool.map(armed_at, enumerate(starts)))
+
+    # Aim each signal at its own run's deadline +/- 250 ms, fired from a time-ordered schedule
+    # so a slow harness never delays the later ones.
+    schedule = sorted(
+        (t + timeout_s + random.Random(i).uniform(-0.25, 0.25), i)
+        for i, t in enumerate(armed)
+        if t is not None
+    )
+
+    def ship(i):
         r = httpx.post(
-            f"{[s1, s2][i % 2]}/v1/runs/{run_id}/signals",
+            f"{[s1, s2][i % 2]}/v1/runs/{starts[i][0]}/signals",
             json={"name": "shipped", "data": {"tracking": f"T{i}"}},
         )
         assert r.status_code in (200, 409), r.text  # 409: already refunded and closed
 
-    with cf.ThreadPoolExecutor(200) as pool:
-        list(pool.map(ship, enumerate(starts)))
+    with cf.ThreadPoolExecutor(64) as pool:
+        futures = []
+        for at, i in schedule:
+            time.sleep(max(0.0, at - time.time()))
+            futures.append(pool.submit(ship, i))
+        for f in futures:
+            f.result()
 
     results = {run_id: c.wait(run_id, timeout=90)["result"]["status"] for run_id, _ in starts}
     shipped = sum(1 for s in results.values() if s == "done")
