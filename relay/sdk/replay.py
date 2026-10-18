@@ -31,6 +31,7 @@ from relay.common.protocol import (
     EventType,
     FailRun,
     RecordValue,
+    RetryPolicy,
     ScheduleStep,
     ensure_json,
 )
@@ -166,7 +167,15 @@ def _expect(ev: Event, type_: EventType, call_seq: int, **fields: Any) -> None:
 
 def _resolve_step(op: StepOp, call_seq: int, evs: list[Event], commands: list[Command]):
     if not evs:
-        commands.append(ScheduleStep(call_seq=call_seq, name=op.name, args=list(op.args)))
+        commands.append(
+            ScheduleStep(
+                call_seq=call_seq,
+                name=op.name,
+                args=list(op.args),
+                retry=op.retry or RetryPolicy(),
+                timeout_s=op.timeout_s,
+            )
+        )
         return _SUSPEND
     _expect(evs[0], EventType.STEP_SCHEDULED, call_seq, name=op.name)
     for ev in evs[1:]:

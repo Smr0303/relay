@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from relay.common.protocol import RetryPolicy
+
 
 @dataclass(frozen=True)
 class WorkflowDef:
@@ -33,7 +35,18 @@ class Registry:
 
         return register(fn) if fn else register
 
-    def step(self, fn=None, *, name: str | None = None):
+    def step(
+        self,
+        fn=None,
+        *,
+        name: str | None = None,
+        retry: RetryPolicy | None = None,
+        timeout_s: float = 30.0,
+        non_retryable: tuple[type[BaseException], ...] = (),
+    ):
+        """Register a step. `retry` and `timeout_s` are journaled with each scheduling;
+        exceptions in `non_retryable` fail the step at once."""
+
         def register(f):
             step_name = name or f.__name__
             existing = self._steps.get(step_name)
@@ -41,6 +54,9 @@ class Registry:
                 raise ValueError(f"step {step_name} is already registered")
             self._steps[step_name] = f
             f.__relay_step__ = step_name
+            f.__relay_retry__ = retry or RetryPolicy()
+            f.__relay_timeout_s__ = timeout_s
+            f.__relay_non_retryable__ = non_retryable
             return f
 
         return register(fn) if fn else register

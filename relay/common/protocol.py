@@ -35,11 +35,26 @@ class Event(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class RetryPolicy(BaseModel):
+    max_attempts: int = 5
+    initial_s: float = 1.0
+    multiplier: float = 2.0
+    max_s: float = 300.0
+    jitter: float = 0.2
+
+    def backoff_s(self, failed_attempt: int, rand: float = 0.5) -> float:
+        """Delay before the attempt after `failed_attempt` (1-based). rand in [0, 1)."""
+        base = min(self.initial_s * self.multiplier ** (failed_attempt - 1), self.max_s)
+        return base * (1 + self.jitter * (2 * rand - 1))
+
+
 class ScheduleStep(BaseModel):
     kind: Literal["schedule_step"] = "schedule_step"
     call_seq: int
     name: str
     args: list[Any]
+    retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    timeout_s: float = 30.0  # lease length; heartbeats extend it
 
 
 class CreateTimer(BaseModel):
@@ -85,7 +100,8 @@ def events_for(cmd: Command) -> list[tuple[EventType, int | None, dict[str, Any]
     """The journal rows a command writes: (type, call_seq, payload)."""
     match cmd:
         case ScheduleStep():
-            return [(EventType.STEP_SCHEDULED, cmd.call_seq, {"name": cmd.name, "args": cmd.args})]
+            payload = {"name": cmd.name, "args": cmd.args}
+            return [(EventType.STEP_SCHEDULED, cmd.call_seq, payload)]
         case CreateTimer():
             payload = {"fire_in_s": cmd.fire_in_s, "signal": cmd.signal}
             return [(EventType.TIMER_CREATED, cmd.call_seq, payload)]
@@ -108,3 +124,64 @@ def ensure_json(value: Any, what: str) -> Any:
     except (TypeError, ValueError) as err:
         raise TypeError(f"{what} must be JSON-serializable: {err}") from None
     return value
+
+
+# ---- HTTP wire models (server <-> worker, server <-> client) --------------------------------
+
+
+class StartRun(BaseModel):
+    workflow: str
+    version: int = 1
+    input: Any = None
+    request_id: str | None = None
+
+
+class SignalIn(BaseModel):
+    name: str
+    data: Any = None
+
+
+class Poll(BaseModel):
+    worker_id: str
+    handles: list[tuple[str, int]]  # (workflow, version) pairs this worker can run
+    max_tasks: int = 1
+    wait_s: float = 20.0
+
+
+class Task(BaseModel):
+    task_id: str
+    lease_token: str
+    kind: Literal["ADVANCE", "STEP"]
+    run_id: str
+    workflow: str
+    version: int
+    attempt: int
+    timeout_s: float
+    # ADVANCE
+    input: Any = None
+    journal: list[Event] = Field(default_factory=list)
+    # STEP
+    call_seq: int | None = None
+    step_name: str | None = None
+    args: list[Any] = Field(default_factory=list)
+
+
+class AckAdvance(BaseModel):
+    lease_token: str
+    journal_len: int
+    commands: list[Command] = Field(default_factory=list)
+    replay_error: dict[str, Any] | None = None  # set when replay itself blew up
+    nondeterminism: bool = False
+    replay_ms: float | None = None
+
+
+class AckStep(BaseModel):
+    lease_token: str
+    result: Any = None
+    error: dict[str, Any] | None = None
+    retryable: bool = True
+    duration_ms: float | None = None
+
+
+class Heartbeat(BaseModel):
+    lease_token: str

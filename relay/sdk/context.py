@@ -9,13 +9,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from relay.common.protocol import ensure_json
+from relay.common.protocol import RetryPolicy, ensure_json
 
 
 @dataclass(frozen=True)
 class StepOp:
     name: str
     args: tuple[Any, ...]
+    retry: RetryPolicy | None = None
+    timeout_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ class WorkflowContext:
         if name is None:
             raise TypeError(f"{fn!r} is not a @step")
         ensure_json(list(args), f"arguments to step {name}")
-        return _Call(StepOp(name, args))
+        return _Call(StepOp(name, args, fn.__relay_retry__, fn.__relay_timeout_s__))
 
     def sleep(self, duration: float | timedelta) -> _Call:
         return _Call(SleepOp(_seconds(duration)))

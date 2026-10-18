@@ -5,22 +5,22 @@ from examples.fake_stripe import DAY, OUTBOX, STRIPE
 from relay import StepContext, step, workflow
 
 
-@step
+@step(timeout_s=5)
 def reserve_stock(sctx: StepContext, order_id: int) -> dict:
     return {"reservation": f"res-{order_id}"}
 
 
-@step
+@step(timeout_s=5)
 def charge_card(sctx: StepContext, order_id: int, amount: int) -> dict:
     return STRIPE.charge(amount, idempotency_key=sctx.idempotency_key)
 
 
-@step
+@step(timeout_s=5)
 def refund(sctx: StepContext, charge_id: str) -> dict:
     return STRIPE.refund(charge_id, idempotency_key=sctx.idempotency_key)
 
 
-@step
+@step(timeout_s=5)
 def send_email(sctx: StepContext, order_id: int, template: str) -> dict:
     return OUTBOX.send(f"customer-{order_id}", template, idempotency_key=sctx.idempotency_key)
 
