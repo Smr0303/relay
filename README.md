@@ -1,5 +1,7 @@
 # Relay
 
+[![ci](https://github.com/Smr0303/relay/actions/workflows/ci.yml/badge.svg)](https://github.com/Smr0303/relay/actions/workflows/ci.yml)
+
 **A durable workflow engine on Postgres.** You write a long-running process as one ordinary `async` function. Relay journals every step, timer and signal, and replays the function from that journal after any crash. Side effects run in steps that carry an engine-supplied idempotency key, and every retry sends the same key.
 
 ```python

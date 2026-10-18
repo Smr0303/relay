@@ -14,7 +14,7 @@ import httpx
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DSN = os.environ.get("RELAY_TEST_DSN", "postgresql://relay:relay@localhost:5440/relay_test")
 ADMIN_DSN = DSN.rsplit("/", 1)[0] + "/relay"
-TABLES = "runs, events, tasks, timers, signals, workflow_versions"
+TABLES = "runs, events, tasks, timers, signals, workflow_versions, servers"
 
 
 def free_port() -> int:

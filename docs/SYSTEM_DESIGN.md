@@ -303,16 +303,17 @@ What the database says after step 3. The row **lies**:
 ```python
 @workflow
 async def order(ctx, order_id):
-    await ctx.step("reserve_stock", reserve, order_id)                  # call_seq 1
-    charge = await ctx.step("charge_card", charge_card, order_id)       # call_seq 2
-    shipped = await ctx.wait_signal("shipped", timeout=days(3))         # call_seq 3
+    await ctx.step("reserve_stock", reserve, order_id)  # call_seq 1
+    charge = await ctx.step("charge_card", charge_card, order_id)  # call_seq 2
+    shipped = await ctx.wait_signal("shipped", timeout=days(3))  # call_seq 3
     if shipped is None:
-        await ctx.step("refund", refund, charge["charge_id"])           # call_seq 4
+        await ctx.step("refund", refund, charge["charge_id"])  # call_seq 4
         return "refunded"
-    await ctx.step("send_receipt", send_email, order_id)                # call_seq 4
+    await ctx.step("send_receipt", send_email, order_id)  # call_seq 4
     return "done"
 
-async def charge_card(ctx, order_id):          # a step: side effects live here
+
+async def charge_card(ctx, order_id):  # a step: side effects live here
     return stripe.charge(amount=5000, idempotency_key=ctx.idempotency_key)  # "r-7f3a:2"
 ```
 

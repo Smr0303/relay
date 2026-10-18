@@ -107,7 +107,7 @@ These were measured in `bench/load.py`, laptop, Docker Postgres:
 
 Runs hash into 16 shards (`run_id % 16`). The timer service, reaper and archiver each run per shard:
 - A server owns a shard by holding a session-level advisory lock on it, and takes `ceil(16 / live servers)` shards.
-- A dead server's locks vanish with its session, and the survivors take its shards within about 2 s.
+- A dead server's locks vanish with its session. Shards that no session holds for two ticks are adopted, so a crashed server's shards move within about 4–6 s. A clean shutdown deletes its heartbeat row, so rebalancing then happens on the next tick.
 
 Ownership is an efficiency measure, not a correctness one: every loop re-checks rows under row locks. Claims are not sharded. At the measured load, one ordered index walk with `SKIP LOCKED` was not a hotspot.
 

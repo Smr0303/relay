@@ -164,6 +164,8 @@ def create_app(
             for t in loops:
                 t.cancel()
             await asyncio.gather(*loops, return_exceptions=True)
+            if "shards" in state:
+                await state["shards"].stop()
             await notifier.stop()
             await pool.close()
 
