@@ -1,0 +1,18 @@
+# Postgres for Phase 2+. Port 5440 keeps clear of other local Postgres instances.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "5440:5432"
+    volumes:
+      - relay-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay"]
+      interval: 2s
+      retries: 15
+volumes:
+  relay-pg:
