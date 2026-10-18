@@ -69,7 +69,7 @@ append events, insert STEP tasks / timers, cancel timers, close the run if finis
 
 ## Signals and timeouts
 
-`wait_signal(name, timeout)` resolves to whichever comes first *in journal order*: the earliest unconsumed matching signal, or its `TimerFired`. Because journal order is the only clock, every replay agrees, and "shipped and also refunded" cannot happen. That claim was checked over 1,000 runs where the signal and timeout land within ±250 ms of each other. A signal that arrives before the wait starts is buffered.
+`wait_signal(name, timeout)` resolves to whichever comes first *in journal order*: the earliest unconsumed matching signal, or its `TimerFired`. Because journal order is the only clock, every replay agrees, and "shipped and also refunded" cannot happen. That claim was checked over 1,000 runs where the signal and timeout land within ±500 ms of each other. A signal that arrives before the wait starts is buffered.
 
 ## Cancellation
 
