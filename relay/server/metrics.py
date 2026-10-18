@@ -34,3 +34,4 @@ LEASED = Gauge("relay_tasks_leased", "Tasks currently leased by workers", ["kind
 JOURNAL_WARNINGS = Counter(
     "relay_journal_warnings_total", "Runs whose journal crossed 10k events (use continue_as_new)"
 )
+RUNS_ARCHIVED = Counter("relay_runs_archived_total", "Closed runs moved out to the archive")

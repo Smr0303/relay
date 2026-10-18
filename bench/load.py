@@ -16,7 +16,6 @@ import subprocess
 import time
 
 import asyncpg
-import httpx
 
 from bench.promtext import counter, delta, quantile, scrape
 from tests.integration.cluster import ADMIN_DSN, Cluster
@@ -66,25 +65,28 @@ def cpu_seconds(pid: int) -> float:
 async def generate(
     servers: list[str], rate: float, duration: float, steps: int, stop_at: list
 ) -> int:
+    """Open-loop starts on aiohttp (httpx's async pool could not keep up at 200 starts/s)."""
+    import aiohttp
+
     started = 0
-    limits = httpx.Limits(max_connections=200)
-    async with httpx.AsyncClient(timeout=30, limits=limits) as http:
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=200), timeout=aiohttp.ClientTimeout(total=30)
+    ) as http:
+
+        async def start(url: str) -> None:
+            async with http.post(
+                url + "/v1/runs", json={"workflow": "bench", "input": {"steps": steps}}
+            ) as r:
+                await r.read()
+
         t0 = time.monotonic()
         pending: set = set()
         while (now := time.monotonic()) - t0 < duration:
             due = int((now - t0) * rate) - started
             for _ in range(max(due, 0)):
-                url = servers[started % len(servers)]
-                pending.add(
-                    asyncio.create_task(
-                        http.post(
-                            url + "/v1/runs", json={"workflow": "bench", "input": {"steps": steps}}
-                        )
-                    )
-                )
+                pending.add(asyncio.create_task(start(servers[started % len(servers)])))
                 started += 1
-            done = {t for t in pending if t.done()}
-            pending -= done
+            pending = {t for t in pending if not t.done()}
             await asyncio.sleep(0.005)
         await asyncio.gather(*pending, return_exceptions=True)
         stop_at.append(time.monotonic())

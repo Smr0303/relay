@@ -43,7 +43,13 @@ async def load(n: int, start_in: float, window: float) -> None:
             events.append((rid, 1, "RunStarted", None, {"input": {"sleep_s": fire_in}}))
             events.append((rid, 2, "TimerCreated", 1, {"fire_in_s": fire_in, "signal": None}))
             timers.append(
-                (uuid.uuid4(), rid, 1, now + __import__("datetime").timedelta(seconds=fire_in))
+                (
+                    uuid.uuid4(),
+                    rid,
+                    rid.int % SHARDS,
+                    1,
+                    now + __import__("datetime").timedelta(seconds=fire_in),
+                )
             )
         await conn.copy_records_to_table(
             "runs",
@@ -54,7 +60,7 @@ async def load(n: int, start_in: float, window: float) -> None:
             "events", records=events, columns=["run_id", "seq", "type", "call_seq", "payload"]
         )
         await conn.copy_records_to_table(
-            "timers", records=timers, columns=["timer_id", "run_id", "call_seq", "fire_at"]
+            "timers", records=timers, columns=["timer_id", "run_id", "shard", "call_seq", "fire_at"]
         )
         await conn.execute("ANALYZE runs; ANALYZE events; ANALYZE timers")
     finally:

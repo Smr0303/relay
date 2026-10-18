@@ -5,3 +5,4 @@ __pycache__/
 .ruff_cache/
 .test-logs/
 .relay-blobs/
+.relay-archive/

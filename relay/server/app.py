@@ -23,6 +23,7 @@ from relay.server.engine import (
     apply_schema,
     create_pool,
 )
+from relay.server.shards import ShardOwner
 
 log = logging.getLogger("relay.server")
 DEFAULT_DSN = "postgresql://relay:relay@localhost:5440/relay"
@@ -144,15 +145,17 @@ def create_app(
         state.update(pool=pool, engine=engine, notifier=notifier)
         loops = []
         if background:
+            owner = ShardOwner(dsn, notifier._id)
+            state["shards"] = owner
             # RELAY_DISABLE_TIMERS simulates a broken timer service (alert drills only).
             timers_on = not os.environ.get("RELAY_DISABLE_TIMERS")
-            loops = [
-                *(
-                    [asyncio.create_task(_loop("timers", timer_interval_s, _timers_once(engine)))]
-                    if timers_on
-                    else []
-                ),
-                asyncio.create_task(_loop("reaper", reaper_interval_s, _reap_once(engine))),
+            timers = _timers_once(engine, owner)
+            loops = [asyncio.create_task(owner.run())]
+            if timers_on:
+                loops.append(asyncio.create_task(_loop("timers", timer_interval_s, timers)))
+            loops += [
+                asyncio.create_task(_loop("reaper", reaper_interval_s, _reap_once(engine, owner))),
+                asyncio.create_task(_loop("archiver", 30.0, _archive_once(engine, owner))),
                 asyncio.create_task(_loop("stats", 2.0, _stats_once(pool))),
             ]
         try:
@@ -279,17 +282,18 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True}
+        owner = state.get("shards")
+        return {"ok": True, "shards": owner.shards() if owner else []}
 
     app.state.relay = state
     return app
 
 
-def _timers_once(engine: Engine):
+def _timers_once(engine: Engine, owner):
     since = {"t": None}
 
     async def run() -> bool:
-        fired = await engine.fire_timers()
+        fired = await engine.fire_timers(owner.shards())
         if since["t"] is None:
             since["t"] = await engine.pool.fetchval("SELECT now()")
         since["t"] = await engine.wake_delayed(since["t"])
@@ -298,10 +302,17 @@ def _timers_once(engine: Engine):
     return run
 
 
-def _reap_once(engine: Engine):
+def _reap_once(engine: Engine, owner):
     async def run() -> bool:
-        await engine.reap()
+        await engine.reap(owner.shards())
         return False
+
+    return run
+
+
+def _archive_once(engine: Engine, owner):
+    async def run() -> bool:
+        return await engine.archive(owner.shards()) > 0
 
     return run
 

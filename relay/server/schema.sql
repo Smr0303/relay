@@ -92,3 +92,13 @@ CREATE TABLE IF NOT EXISTS workflow_versions (
   seen_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (workflow, version)
 );
+
+-- Timers carry their run's shard so each server fires only the shards it owns.
+ALTER TABLE timers ADD COLUMN IF NOT EXISTS shard smallint NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS timers_due_shard ON timers (shard, fire_at) WHERE state = 'pending';
+
+-- Live servers (for sharing out shard ownership) and the archive cursor.
+CREATE TABLE IF NOT EXISTS servers (
+  server_id text PRIMARY KEY,
+  seen_at   timestamptz NOT NULL DEFAULT now()
+);

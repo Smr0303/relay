@@ -41,10 +41,12 @@ from relay.server import metrics
 from relay.server.blobs import BlobStore, blob_store_from_env
 
 SHARDS = 16
-SCHEMA_VERSION = 2  # bump when schema.sql changes
+SCHEMA_VERSION = 3  # bump when schema.sql changes
 JOURNAL_WARN = 10_000
 JOURNAL_LIMIT = int(os.environ.get("RELAY_JOURNAL_LIMIT", 50_000))
 ADVANCE_BACKOFF_S = float(os.environ.get("RELAY_ADVANCE_BACKOFF_S", 1.0))
+RETENTION_S = float(os.environ.get("RELAY_RETENTION_S", 7 * 86400))
+ARCHIVE_DIR = os.environ.get("RELAY_ARCHIVE_DIR", os.path.abspath(".relay-archive"))
 TERMINAL = ("completed", "failed", "cancelled", "continued")
 ADVANCE_MAX_ATTEMPTS = 5
 ADVANCE_TIMEOUT_S = float(os.environ.get("RELAY_ADVANCE_TIMEOUT_S", 30))
@@ -550,9 +552,9 @@ class Engine:
             notify = True
         if timers:
             await conn.executemany(
-                "INSERT INTO timers (timer_id, run_id, call_seq, fire_at) "
-                "VALUES ($1, $2, $3, now() + make_interval(secs => $4))",
-                [(uuid.uuid4(), rid, t.call_seq, t.fire_in_s) for t in timers],
+                "INSERT INTO timers (timer_id, run_id, shard, call_seq, fire_at) "
+                "VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+                [(uuid.uuid4(), rid, run["shard"], t.call_seq, t.fire_in_s) for t in timers],
             )
         if cancels:
             await conn.execute(
@@ -674,15 +676,21 @@ class Engine:
 
     # background loops
 
-    async def fire_timers(self, limit: int = 500) -> int:
-        """Fire due timers in one batch. Never waits for a run lock (SKIP LOCKED), because it
-        holds timer rows that an ack (which holds the run lock) may want to cancel."""
+    async def fire_timers(self, shards: list[int] | None = None, limit: int = 500) -> int:
+        """Fire due timers of the given shards (all when None) in one batch. Never waits for a
+        run lock (SKIP LOCKED): it holds timer rows that an ack (holding the run lock) may want
+        to cancel."""
+        shards = list(range(SHARDS)) if shards is None else shards
+        if not shards:
+            return 0
         async with self._tx() as conn:
             due = await conn.fetch(
                 "SELECT timer_id, run_id, call_seq, extract(epoch FROM now() - fire_at) AS lag "
                 "FROM timers WHERE state='pending' AND fire_at <= now() "
+                "AND shard = ANY($2::smallint[]) "
                 "ORDER BY fire_at LIMIT $1 FOR UPDATE SKIP LOCKED",
                 limit,
+                shards,
             )
             if not due:
                 return 0
@@ -734,6 +742,63 @@ class Engine:
                 )
             return len(fired)
 
+    async def archive(self, shards: list[int], limit: int = 500) -> int:
+        """Move closed runs older than RELAY_RETENTION_S out of Postgres into JSONL files
+        (one line per run: the run row + its journal), then delete them. The file is written
+        before the delete commits, so a crash in between re-archives those runs next time:
+        archiving is at-least-once, deduplicate by run_id when reading. S3 would replace the
+        file write; nothing else changes."""
+        if not shards:
+            return 0
+        async with self._tx() as conn:
+            runs = await conn.fetch(
+                "SELECT * FROM runs WHERE closed_at IS NOT NULL "
+                "AND closed_at < now() - make_interval(secs => $1) "
+                "AND shard = ANY($2::smallint[]) ORDER BY closed_at LIMIT $3 "
+                "FOR UPDATE SKIP LOCKED",
+                RETENTION_S,
+                shards,
+                limit,
+            )
+            if not runs:
+                return 0
+            ids = [r["run_id"] for r in runs]
+            journal: dict = {rid: [] for rid in ids}
+            for e in await conn.fetch(
+                "SELECT run_id, seq, type, call_seq, payload, at FROM events "
+                "WHERE run_id = ANY($1::uuid[]) ORDER BY run_id, seq",
+                ids,
+            ):
+                journal[e["run_id"]].append(
+                    {
+                        "seq": e["seq"],
+                        "type": e["type"],
+                        "call_seq": e["call_seq"],
+                        "payload": e["payload"],
+                        "at": e["at"].isoformat(),
+                    }
+                )
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            path = os.path.join(ARCHIVE_DIR, f"runs-{uuid.uuid4().hex}.jsonl")
+            with open(path + ".tmp", "w") as f:
+                for r in runs:
+                    row = {
+                        k: (
+                            v.isoformat()
+                            if hasattr(v, "isoformat")
+                            else str(v)
+                            if isinstance(v, uuid.UUID)
+                            else v
+                        )
+                        for k, v in dict(r).items()
+                    }
+                    f.write(json.dumps({"run": row, "events": journal[r["run_id"]]}) + "\n")
+            os.replace(path + ".tmp", path)
+            for table in ("events", "signals", "timers", "tasks", "runs"):
+                await conn.execute(f"DELETE FROM {table} WHERE run_id = ANY($1::uuid[])", ids)
+        metrics.RUNS_ARCHIVED.inc(len(ids))
+        return len(ids)
+
     async def wake_delayed(self, since):
         """NOTIFY when a backed-off task's not_before passed since the last check, so a retry
         starts within ~0.1 s of its deadline instead of at the next 1 s fallback poll."""
@@ -746,12 +811,16 @@ class Engine:
             self.on_tasks()
         return row["now"]
 
-    async def reap(self, limit: int = 500) -> int:
+    async def reap(self, shards: list[int] | None = None, limit: int = 500) -> int:
         """Take back tasks whose lease expired: the worker holding them is presumed dead."""
+        shards = list(range(SHARDS)) if shards is None else shards
+        if not shards:
+            return 0
         expired = await self.pool.fetch(
             "SELECT task_id FROM tasks WHERE lease_owner IS NOT NULL AND lease_until < now() "
-            "LIMIT $1",
+            "AND shard = ANY($2::smallint[]) LIMIT $1",
             limit,
+            shards,
         )
         n = 0
         for row in expired:
