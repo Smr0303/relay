@@ -131,3 +131,25 @@ def test_large_step_result_is_kept_out_of_the_journal_row(cluster, tmp_path):
     done = next(e for e in c.events(run["run_id"]) if e["type"] == "StepCompleted")
     assert "result" not in done["payload"] and done["payload"]["bytes"] > 300 * 1024
     assert list(tmp_path.iterdir())
+
+
+def test_dashboard_lists_runs_and_acts_on_them(cluster):
+    server = cluster.start_server()
+    cluster.start_effects()
+    cluster.env["ORDER_DAY_SECONDS"] = "60"
+    cluster.start_worker("examples.order")
+    c = Client(server)
+    run_id = c.start("order", {"order_id": 9, "amount": 5000})
+    c.wait(run_id, timeout=10, statuses={"suspended"})
+    page = httpx.get(f"{server}/ui?status=suspended").text
+    assert run_id in page
+    detail = httpx.get(f"{server}/ui/runs/{run_id}").text
+    assert "StepCompleted" in detail and "Send signal" in detail
+    r = httpx.post(
+        f"{server}/ui/runs/{run_id}/signal",
+        data={"name": "shipped", "data": '{"tracking": "UI-1"}'},
+    )
+    assert r.status_code == 303
+    assert c.wait(run_id, timeout=10, statuses={"suspended"})  # receipt sent, now sleeping
+    httpx.post(f"{server}/ui/runs/{run_id}/cancel")
+    assert c.wait(run_id, timeout=10)["status"] == "cancelled"

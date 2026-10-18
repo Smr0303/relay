@@ -127,6 +127,9 @@ class Cluster:
         return httpx.get(self.effects_url + "/stats", timeout=5).json()
 
     def stop(self) -> None:
+        for p in self.servers.values():
+            if p not in self.procs:
+                self.procs.append(p)
         for p in self.workers + self.procs:
             if p.poll() is None:
                 p.terminate()

@@ -1,0 +1,30 @@
+# The four engine-health alerts from the design (Summary, HLD telemetry box).
+groups:
+  - name: relay
+    rules:
+      - alert: RelayTaskBacklog
+        expr: max(relay_oldest_ready_task_seconds) > 60
+        labels: {severity: page}
+        annotations:
+          summary: "A ready task has waited > 60 s for a worker"
+          runbook: "Are workers up and polling the right workflow versions? Check relay_queue_depth."
+      - alert: RelayTimerLag
+        expr: max(relay_timers_overdue_seconds) > 30
+        labels: {severity: page}
+        annotations:
+          summary: "A timer is > 30 s overdue"
+          runbook: "Timer service stalled: are servers up? Are their timer loops erroring?"
+      - alert: RelayLeaseExpiries
+        expr: >
+          sum(rate(relay_lease_expiries_total[2m]))
+            / clamp_min(sum(rate(relay_dispatch_latency_seconds_count[2m])), 0.001) > 0.01
+        labels: {severity: ticket}
+        annotations:
+          summary: "> 1% of tasks lose their lease (workers dying or steps outliving timeout_s)"
+          runbook: "Worker crash loop? OOM? A step without heartbeats exceeding its timeout?"
+      - alert: RelayNonDeterminism
+        expr: sum(increase(relay_nondeterminism_total[15m])) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A deploy changed code under live runs; they are parked"
+          runbook: "Roll back or add ctx.patched(), then resume the parked runs (dashboard)."

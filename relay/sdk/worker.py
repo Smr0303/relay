@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
+from relay.common import tracing
 from relay.common.protocol import AckAdvance, AckStep, Task, ensure_json
 from relay.sdk.context import StepContext
 from relay.sdk.replay import NonDeterminismError, error_dict, replay
@@ -131,13 +132,25 @@ class Worker:
     async def _advance(self, task: Task) -> None:
         body = AckAdvance(lease_token=task.lease_token, journal_len=len(task.journal))
         t0 = time.perf_counter()
-        try:
-            wf = self.registry.get_workflow(task.workflow, task.version)
-            body.commands = replay(wf.fn, task.input, task.journal, run_id=task.run_id).commands
-        except NonDeterminismError as err:
-            body.replay_error, body.nondeterminism = error_dict(err), True
-        except Exception as err:  # a bug in workflow code or a missing registration
-            body.replay_error = error_dict(err)
+        with tracing.span(
+            "replay",
+            task.run_id,
+            workflow=task.workflow,
+            version=task.version,
+            events=len(task.journal),
+            worker=self.worker_id,
+        ) as s:
+            try:
+                wf = self.registry.get_workflow(task.workflow, task.version)
+                body.commands = replay(wf.fn, task.input, task.journal, run_id=task.run_id).commands
+            except NonDeterminismError as err:
+                body.replay_error, body.nondeterminism = error_dict(err), True
+            except Exception as err:  # a bug in workflow code or a missing registration
+                body.replay_error = error_dict(err)
+            if s is not None:
+                s.set_attribute("relay.commands", ",".join(c.kind for c in body.commands))
+                if body.replay_error:
+                    s.set_attribute("relay.error", body.replay_error["type"])
         body.replay_ms = (time.perf_counter() - t0) * 1000
         await self._ack(f"/v1/tasks/{task.task_id}/ack/advance", body, task.timeout_s)
 
@@ -147,11 +160,19 @@ class Worker:
         beat = asyncio.create_task(self._heartbeat(task))
         t0 = time.perf_counter()
         try:
-            if inspect.iscoroutinefunction(fn):
-                result = await fn(sctx, *task.args)
-            else:
-                result = await asyncio.to_thread(fn, sctx, *task.args)
-            ensure_json(result, f"result of step {task.step_name}")
+            with tracing.span(
+                f"step {task.step_name}",
+                task.run_id,
+                call_seq=task.call_seq,
+                attempt=task.attempt,
+                worker=self.worker_id,
+                idempotency_key=sctx.idempotency_key,
+            ):
+                if inspect.iscoroutinefunction(fn):
+                    result = await fn(sctx, *task.args)
+                else:
+                    result = await asyncio.to_thread(fn, sctx, *task.args)
+                ensure_json(result, f"result of step {task.step_name}")
             body = AckStep(lease_token=task.lease_token, result=result)
         except Exception as err:
             retryable = not isinstance(err, getattr(fn, "__relay_non_retryable__", ())) and getattr(
@@ -215,6 +236,7 @@ def main() -> None:
     )
     for mod in args.app:
         importlib.import_module(mod)
+    tracing.init("relay-worker")
     worker = Worker(args.server, worker_id=args.id, slots=args.slots, pollers=args.pollers)
 
     async def runner():

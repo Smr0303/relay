@@ -19,6 +19,7 @@ from typing import Any
 
 import asyncpg
 
+from relay.common import tracing
 from relay.common.protocol import (
     AckAdvance,
     AckStep,
@@ -133,13 +134,20 @@ async def _enqueue_advance(conn, run) -> None:
 
 
 async def _close_run(conn, run_id, status: str, result: Any = None, error: Any = None) -> None:
-    await conn.execute(
+    row = await conn.fetchrow(
         "UPDATE runs SET status=$2, result=$3, error=$4, updated_at=now(), closed_at=now() "
-        "WHERE run_id=$1",
+        "WHERE run_id=$1 RETURNING workflow, created_at, closed_at",
         run_id,
         status,
         result,
         error,
+    )
+    tracing.run_root(
+        str(run_id),
+        row["workflow"],
+        status,
+        int(row["created_at"].timestamp() * 1e9),
+        int(row["closed_at"].timestamp() * 1e9),
     )
     await conn.execute("DELETE FROM tasks WHERE run_id=$1", run_id)
     await conn.execute(
@@ -785,6 +793,15 @@ class Engine:
     async def _step_lease_expired(self, conn, run, task) -> None:
         policy = RetryPolicy(**(task["retry"] or {}))
         attempt = task["attempt"]
+        end = task["lease_until"].timestamp()
+        tracing.lost_attempt(
+            str(run["run_id"]),
+            task["step_name"],
+            attempt,
+            task["call_seq"],
+            int((end - task["timeout_s"]) * 1e9),
+            int(end * 1e9),
+        )
         final = attempt >= policy.max_attempts
         error = {"type": "LeaseExpired", "message": f"no ack within {task['timeout_s']}s"}
         rows = [

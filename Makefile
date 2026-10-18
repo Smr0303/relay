@@ -1,4 +1,4 @@
-.PHONY: setup up down test lint bench-replay chaos bench timer-soak
+.PHONY: setup up down test lint bench-replay chaos bench timer-soak obs-up obs-drill demo
 
 setup:
 	uv sync
@@ -27,3 +27,12 @@ bench:
 
 timer-soak:
 	uv run python -m bench.timer_soak --runs 100000 --window 60
+
+obs-up:
+	docker compose --profile obs up -d --wait
+
+obs-drill:
+	uv run python -m tests.obs.drill
+
+demo:
+	uv run python -m bench.demo

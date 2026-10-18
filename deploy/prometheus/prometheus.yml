@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+rule_files: ["alerts.yml"]
+scrape_configs:
+  - job_name: relay
+    # bench/demo.py and tests/obs/alert_drill.py run servers on these fixed ports
+    static_configs:
+      - targets: ["host.docker.internal:8080", "host.docker.internal:8081"]

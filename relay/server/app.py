@@ -11,6 +11,7 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from relay.common import tracing
 from relay.common.protocol import AckAdvance, AckStep, Heartbeat, Poll, SignalIn, StartRun
 from relay.server import metrics
 from relay.server.engine import (
@@ -134,6 +135,7 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        tracing.init("relay-server")
         pool = await create_pool(dsn, min_size=2, max_size=int(os.environ.get("RELAY_POOL", 20)))
         await apply_schema(pool)
         notifier = Notifier()
@@ -142,8 +144,14 @@ def create_app(
         state.update(pool=pool, engine=engine, notifier=notifier)
         loops = []
         if background:
+            # RELAY_DISABLE_TIMERS simulates a broken timer service (alert drills only).
+            timers_on = not os.environ.get("RELAY_DISABLE_TIMERS")
             loops = [
-                asyncio.create_task(_loop("timers", timer_interval_s, _timers_once(engine))),
+                *(
+                    [asyncio.create_task(_loop("timers", timer_interval_s, _timers_once(engine)))]
+                    if timers_on
+                    else []
+                ),
                 asyncio.create_task(_loop("reaper", reaper_interval_s, _reap_once(engine))),
                 asyncio.create_task(_loop("stats", 2.0, _stats_once(pool))),
             ]
@@ -260,6 +268,10 @@ def create_app(
         except (LeaseLost, NotFound) as err:
             raise HTTPException(409, f"lease lost: {err}") from None
         return {"ok": True}
+
+    from relay.server.ui import router as ui_router
+
+    app.include_router(ui_router(eng))
 
     @app.get("/metrics")
     async def prom():
