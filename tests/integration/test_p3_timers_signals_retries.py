@@ -2,13 +2,13 @@
 
 import asyncio
 import concurrent.futures as cf
+import heapq
 import random
 import threading
 import time
 from datetime import datetime
 
 import asyncpg
-import httpx
 
 from relay.sdk.client import Client
 from tests.integration.cluster import DSN
@@ -36,44 +36,55 @@ def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
             local.c = {s: Client(s) for s in servers}
         return local.c[servers[i % 2]]
 
-    with cf.ThreadPoolExecutor(32) as pool:
-        ids = list(
-            pool.map(
-                lambda i: client(i).start("race_order", {"order_id": i, "timeout_s": timeout_s}),
-                range(n),
-            )
-        )
+    # Pace starts at 50/s so deadlines (and so signals) spread over ~20 s: the harness then
+    # sends ~50 signals/s, which even a 2-core CI runner delivers within the +/-250 ms window.
+    ids: list = [None] * n
+    schedule: list = []  # heap of (send_at, i), filled as each run arms its timeout
+    cond = threading.Condition()
+    t0 = time.time()
 
-    def armed_at(i: int) -> float:
-        """When this run's wait (and so its timeout clock) started."""
+    def start_and_arm(i: int) -> None:
+        time.sleep(max(0.0, t0 + i / 50 - time.time()))
         cl = client(i)
+        ids[i] = cl.start("race_order", {"order_id": i, "timeout_s": timeout_s})
         cl.wait(ids[i], timeout=60, statuses={"suspended"})
-        return next(_at(e) for e in cl.events(ids[i]) if e["type"] == "TimerCreated")
-
-    with cf.ThreadPoolExecutor(64) as pool:
-        armed = list(pool.map(armed_at, range(n)))
-    late = time.time() - (min(armed) + timeout_s)
-    assert late < 0, f"harness too slow: collection finished {late:.1f} s after the first deadline"
-
-    # Fire each signal from a time-ordered schedule so a slow harness never delays later ones.
-    schedule = sorted(
-        (t + timeout_s + random.Random(i).uniform(-0.25, 0.25), i) for i, t in enumerate(armed)
-    )
+        armed = next(_at(e) for e in cl.events(ids[i]) if e["type"] == "TimerCreated")
+        jitter = random.Random(i).uniform(-0.25, 0.25)
+        with cond:
+            heapq.heappush(schedule, (armed + timeout_s + jitter, i))
+            cond.notify()
 
     def ship(i: int) -> None:
-        r = httpx.post(
-            f"{servers[i % 2]}/v1/runs/{ids[i]}/signals",
-            json={"name": "shipped", "data": {"tracking": f"T{i}"}},
+        r = client(i)._http.post(
+            f"/v1/runs/{ids[i]}/signals", json={"name": "shipped", "data": {"tracking": f"T{i}"}}
         )
         assert r.status_code in (200, 409), r.text  # 409: already refunded and closed
 
-    with cf.ThreadPoolExecutor(64) as pool:
-        futures = []
-        for at, i in schedule:
-            time.sleep(max(0.0, at - time.time()))
-            futures.append(pool.submit(ship, i))
-        for f in futures:
+    lates: list = []
+    with cf.ThreadPoolExecutor(64) as senders, cf.ThreadPoolExecutor(64) as starters:
+        starting = [starters.submit(start_and_arm, i) for i in range(n)]
+        sent = []
+        while len(sent) < n:
+            with cond:
+                if not schedule:
+                    cond.wait(0.05)
+                    if any(f.done() and f.exception() for f in starting):
+                        break
+                    continue
+                at, i = schedule[0]
+                delay = at - time.time()
+                if delay > 0:
+                    cond.wait(min(delay, 0.05))
+                    continue
+                heapq.heappop(schedule)
+            lates.append(-delay)
+            sent.append(senders.submit(ship, i))
+        for f in starting + sent:
             f.result()
+    lates.sort()
+    assert lates[int(0.9 * n)] < 0.1, (
+        f"harness dispatched signals late: p90 {lates[int(0.9 * n)]:.2f} s"
+    )
 
     c = Client(s1)
     results = {rid: c.wait(rid, timeout=90)["result"]["status"] for rid in ids}
