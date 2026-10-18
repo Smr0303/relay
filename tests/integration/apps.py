@@ -58,3 +58,24 @@ async def non_retryable(ctx, inp):
 async def sleeper(ctx, inp):
     await ctx.sleep(inp["sleep_s"])
     return "woke"
+
+
+@step(retry=RetryPolicy(max_attempts=5, initial_s=0.2, multiplier=2.0, jitter=0.0))
+def always_fails(sctx: StepContext) -> None:
+    raise ConnectionError(f"attempt {sctx.attempt} failed")
+
+
+@workflow
+async def gives_up(ctx, inp):
+    await ctx.step(always_fails)
+
+
+@step(timeout_s=2)
+def long_step(sctx: StepContext, seconds: float) -> dict:
+    time.sleep(seconds)  # far longer than the 2 s lease: only heartbeats keep it alive
+    return {"slept": seconds, "attempt": sctx.attempt}
+
+
+@workflow
+async def long_running(ctx, inp):
+    return await ctx.step(long_step, inp["seconds"])

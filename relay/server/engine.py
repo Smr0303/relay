@@ -38,6 +38,7 @@ from relay.common.protocol import (
 from relay.server import metrics
 
 SHARDS = 16
+SCHEMA_VERSION = 1  # bump when schema.sql changes
 TERMINAL = ("completed", "failed", "cancelled", "continued")
 ADVANCE_MAX_ATTEMPTS = 5
 ADVANCE_TIMEOUT_S = float(os.environ.get("RELAY_ADVANCE_TIMEOUT_S", 30))
@@ -74,10 +75,19 @@ async def apply_schema(pool: asyncpg.Pool) -> None:
 
     sql = files("relay.server").joinpath("schema.sql").read_text()
     async with pool.acquire() as conn:
+        # The script takes exclusive table locks (ALTER TABLE), so a server joining a busy
+        # cluster must not run it: apply only when the recorded version is behind.
+        await conn.execute("CREATE TABLE IF NOT EXISTS relay_schema (version int NOT NULL)")
+        if await conn.fetchval("SELECT max(version) FROM relay_schema") == SCHEMA_VERSION:
+            return
         # Serialise concurrent server starts: CREATE ... IF NOT EXISTS is not race-safe.
         await conn.execute("SELECT pg_advisory_lock(424242)")
         try:
-            await conn.execute(sql)
+            if await conn.fetchval("SELECT max(version) FROM relay_schema") != SCHEMA_VERSION:
+                async with conn.transaction():
+                    await conn.execute(sql)
+                    await conn.execute("DELETE FROM relay_schema")
+                    await conn.execute("INSERT INTO relay_schema VALUES ($1)", SCHEMA_VERSION)
         finally:
             await conn.execute("SELECT pg_advisory_unlock(424242)")
 

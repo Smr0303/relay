@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS runs (
   workflow    text NOT NULL,
   version     int  NOT NULL,
   status      text NOT NULL,      -- running|suspended|completed|failed|cancelled|parked|continued
-  input       jsonb NOT NULL,
+  input       jsonb,              -- NULL = JSON null input
   result      jsonb,
   error       jsonb,
   request_id  text UNIQUE,        -- idempotent start
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS runs (
   updated_at  timestamptz NOT NULL DEFAULT now(),
   closed_at   timestamptz
 );
+ALTER TABLE runs ALTER COLUMN input DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS runs_status ON runs (status, updated_at);
 CREATE INDEX IF NOT EXISTS runs_closed ON runs (closed_at) WHERE closed_at IS NOT NULL;
 
