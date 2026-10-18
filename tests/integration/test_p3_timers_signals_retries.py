@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures as cf
 import random
+import threading
 import time
 from datetime import datetime
 
@@ -20,52 +21,48 @@ def _at(e) -> float:
 
 
 def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
-    """1,000 orders; "shipped" lands right around the 3-"day" timeout (1 day = 2 s here).
-    Every order must end exactly one way, with effects to match."""
-    cluster.env["ORDER_DAY_SECONDS"] = "2"  # timeout 6 s: room to aim signals on slow CI
+    """1,000 orders; "shipped" lands within +/-250 ms of each order's own timeout. Every order
+    must end exactly one way (refund XOR receipt), with effects to match."""
     s1, s2 = cluster.start_server(), cluster.start_server()
     cluster.start_effects()
     for _ in range(4):
-        cluster.start_worker("examples.order", slots=200)
-    c = Client(s1)
-    n = 1000
-    timeout_s = 6.0
+        cluster.start_worker(APPS, slots=200)
+    n, timeout_s = 1000, 15.0  # generous, so a slow CI runner can still aim the signals
+    servers = [s1, s2]
+    local = threading.local()
+
+    def client(i: int) -> Client:
+        if not hasattr(local, "c"):
+            local.c = {s: Client(s) for s in servers}
+        return local.c[servers[i % 2]]
+
     with cf.ThreadPoolExecutor(32) as pool:
-        starts = list(
+        ids = list(
             pool.map(
-                lambda i: (
-                    Client([s1, s2][i % 2]).start("order", {"order_id": i, "amount": 5000}),
-                    time.monotonic(),
-                ),
+                lambda i: client(i).start("race_order", {"order_id": i, "timeout_s": timeout_s}),
                 range(n),
             )
         )
 
-    def armed_at(item):
-        """When this run's wait (and its timeout) started, or None if it already closed."""
-        i, (run_id, _) = item
-        cl = Client([s1, s2][i % 2])
-        if (
-            cl.wait(run_id, timeout=60, statuses={"suspended", "completed"})["status"]
-            != "suspended"
-        ):
-            return None
-        return next(_at(e) for e in cl.events(run_id) if e["type"] == "TimerCreated")
+    def armed_at(i: int) -> float:
+        """When this run's wait (and so its timeout clock) started."""
+        cl = client(i)
+        cl.wait(ids[i], timeout=60, statuses={"suspended"})
+        return next(_at(e) for e in cl.events(ids[i]) if e["type"] == "TimerCreated")
 
     with cf.ThreadPoolExecutor(64) as pool:
-        armed = list(pool.map(armed_at, enumerate(starts)))
+        armed = list(pool.map(armed_at, range(n)))
+    late = time.time() - (min(armed) + timeout_s)
+    assert late < 0, f"harness too slow: collection finished {late:.1f} s after the first deadline"
 
-    # Aim each signal at its own run's deadline +/- 250 ms, fired from a time-ordered schedule
-    # so a slow harness never delays the later ones.
+    # Fire each signal from a time-ordered schedule so a slow harness never delays later ones.
     schedule = sorted(
-        (t + timeout_s + random.Random(i).uniform(-0.25, 0.25), i)
-        for i, t in enumerate(armed)
-        if t is not None
+        (t + timeout_s + random.Random(i).uniform(-0.25, 0.25), i) for i, t in enumerate(armed)
     )
 
-    def ship(i):
+    def ship(i: int) -> None:
         r = httpx.post(
-            f"{[s1, s2][i % 2]}/v1/runs/{starts[i][0]}/signals",
+            f"{servers[i % 2]}/v1/runs/{ids[i]}/signals",
             json={"name": "shipped", "data": {"tracking": f"T{i}"}},
         )
         assert r.status_code in (200, 409), r.text  # 409: already refunded and closed
@@ -78,7 +75,8 @@ def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
         for f in futures:
             f.result()
 
-    results = {run_id: c.wait(run_id, timeout=90)["result"]["status"] for run_id, _ in starts}
+    c = Client(s1)
+    results = {rid: c.wait(rid, timeout=90)["result"]["status"] for rid in ids}
     shipped = sum(1 for s in results.values() if s == "done")
     refunded = sum(1 for s in results.values() if s == "refunded")
     assert shipped + refunded == n
@@ -95,10 +93,9 @@ def test_signal_vs_timeout_race_never_ships_and_refunds(cluster):
 
     fx = asyncio.run(effects())
     for run_id, status in results.items():
-        charged = (f"{run_id}:2", "charge") in fx
-        refund = (f"{run_id}:4", "refund") in fx
-        receipt = (f"{run_id}:4", "email") in fx
-        assert charged
+        assert (f"{run_id}:1", "charge") in fx
+        refund = (f"{run_id}:3", "refund") in fx
+        receipt = (f"{run_id}:3", "email") in fx
         assert refund != receipt, (run_id, status, refund, receipt)  # never both, never neither
         assert (status == "refunded") == refund
     assert sum(1 for _, kind in fx if kind == "charge") == n

@@ -106,3 +106,30 @@ def big(sctx, kb: int) -> str:
 @workflow
 async def big_result(ctx, inp):
     return len(await ctx.step(big, inp["kb"]))
+
+
+@step(timeout_s=5)
+def race_charge(sctx: StepContext, order_id: int) -> dict:
+    return STRIPE.charge(5000, idempotency_key=sctx.idempotency_key)
+
+
+@step(timeout_s=5)
+def race_refund(sctx: StepContext, charge_id: str) -> dict:
+    return STRIPE.refund(charge_id, idempotency_key=sctx.idempotency_key)
+
+
+@step(timeout_s=5)
+def race_receipt(sctx: StepContext, order_id: int) -> dict:
+    return STRIPE.send(f"customer-{order_id}", "receipt", idempotency_key=sctx.idempotency_key)
+
+
+@workflow
+async def race_order(ctx, inp):
+    """The order's race in isolation: "shipped" vs its timeout decides refund XOR receipt."""
+    charge = await ctx.step(race_charge, inp["order_id"])  # call 1
+    shipped = await ctx.wait_signal("shipped", timeout=inp["timeout_s"])  # call 2
+    if shipped is None:
+        await ctx.step(race_refund, charge["charge_id"])  # call 3
+        return {"status": "refunded"}
+    await ctx.step(race_receipt, inp["order_id"])  # call 3
+    return {"status": "done"}
